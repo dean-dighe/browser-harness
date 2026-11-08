@@ -87,3 +87,41 @@ def tmp_dir() -> Path:
 def workspace_dir() -> Path:
     raw = os.environ.get("BH_AGENT_WORKSPACE")
     return ensure_private_dir(Path(raw).expanduser().resolve() if raw else home_dir() / "agent-workspace")
+
+
+def cdp_endpoint():
+    """The configured CDP endpoint as host:port (lower case), or None. A daemon reports it in its ping."""
+    from urllib.parse import urlparse
+    url = os.environ.get("BU_CDP_URL") or os.environ.get("BU_CDP_WS")
+    if not url:
+        return None
+    try:
+        p = urlparse(url)
+        return f"{(p.hostname or '').lower()}:{p.port}" if p.hostname and p.port else None
+    except ValueError:
+        return None
+
+
+def strict_check_ws(ws_url):
+    """In strict mode the WebSocket that /json/version names must be on the configured host and port (ws://)."""
+    if not strict():
+        return
+    from urllib.parse import urlparse
+    try:
+        p = urlparse(ws_url)
+        here = f"{(p.hostname or '').lower()}:{p.port}"
+    except (TypeError, ValueError):
+        here = None
+    if not isinstance(ws_url, str) or p.scheme != "ws" or here != cdp_endpoint():
+        raise RuntimeError("strict-cdp: /json/version named a WebSocket outside the configured endpoint (BH_STRICT_CDP=1)")
+
+
+def no_redirect_opener():
+    """A urllib opener that refuses every redirect: in strict mode discovery never leaves the configured endpoint."""
+    import urllib.request
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            raise RuntimeError("strict-cdp: CDP discovery was redirected (BH_STRICT_CDP=1)")
+
+    return urllib.request.build_opener(_NoRedirect)

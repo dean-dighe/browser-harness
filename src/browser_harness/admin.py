@@ -524,10 +524,42 @@ def run_doctor_fix_snap():
     return 0
 
 
+def _strict_check_daemon(name, env=None):
+    """Strict mode reuses a live daemon only when it runs strict on the endpoint this caller configured."""
+    want = None
+    saved = {k: os.environ.get(k) for k in ("BU_CDP_URL", "BU_CDP_WS")}
+    try:
+        for k in saved:
+            if env and k in env:
+                os.environ[k] = env[k] or ""
+        want = paths.cdp_endpoint()
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    try:
+        s, token = ipc.connect(name or NAME, timeout=2.0)
+        try:
+            resp = ipc.request(s, token, {"meta": "ping"})
+        finally:
+            s.close()
+    except Exception:
+        resp = None
+    if not (isinstance(resp, dict) and resp.get("strict") is True and resp.get("browser_kind") == "cdp"
+            and want is not None and resp.get("endpoint") == want):
+        raise RuntimeError(
+            f"strict-cdp: daemon {name or NAME!r} is running with another configuration; stop it before strict use"
+        )
+
+
 def ensure_daemon(wait=None, name=None, env=None):
     """Idempotent. Self-heals stale daemon, closed Chrome (launches it), cold
     Chrome, and missing Allow on chrome://inspect."""
     paths.strict_check_env(env)  # strict mode: one loopback CDP endpoint, no cloud, so never local discovery or launch
+    if paths.strict() and daemon_alive(name):
+        _strict_check_daemon(name, env)
     if daemon_alive(name):
         # Stale daemons accept connects AND reply to meta:* (pure Python) even when the
         # CDP WS to Chrome is dead — probe with a real CDP call and require "result".

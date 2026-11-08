@@ -308,9 +308,17 @@ def get_ws_url():
         deadline = time.time() + 30
         last_err = None
         base_url = url.rstrip("/")
+        opener = paths.no_redirect_opener() if paths.strict() else urllib.request.build_opener()
         while time.time() < deadline:
             try:
-                return json.loads(urllib.request.urlopen(f"{base_url}/json/version", timeout=5).read())["webSocketDebuggerUrl"]
+                ws = json.loads(opener.open(f"{base_url}/json/version", timeout=5).read())["webSocketDebuggerUrl"]
+                paths.strict_check_ws(ws)
+                return ws
+            except RuntimeError as e:
+                if str(e).startswith("strict-cdp"):
+                    raise  # a refusal, not a browser still starting: no retry
+                last_err = e
+                time.sleep(1)
             except urllib.error.HTTPError as e:
                 last_err = e
                 if e.code == 403:
@@ -751,11 +759,15 @@ class Daemon:
         # daemon and not an unrelated process that reused our port post-crash.
         # `pid` lets restart_daemon() verify the live daemon's identity before
         # signaling — protects against SIGTERM-by-stale-pid-file after PID reuse.
-        if meta == "ping":        return {"pong": True, "pid": os.getpid(), "browser_kind": BROWSER_KIND}
+        if meta == "ping":
+            return {"pong": True, "pid": os.getpid(), "browser_kind": BROWSER_KIND,
+                    "strict": paths.strict(), "endpoint": paths.cdp_endpoint()}
         if meta == "shutdown" and self.sensitive is not None:
-            # A deliberate stop ends the sign-in attempt; its tab is closed before the daemon goes.
+            # A deliberate stop ends the sign-in attempt; its tab is closed before the daemon goes. If Chrome does not
+            # confirm the close, the daemon stays up and keeps the guards.
             async with self._sensitive_lock:
-                await self._sensitive_end(close=True)
+                if not await self._sensitive_end(close=True):
+                    return {"error": "sensitive-end-failed"}
         if self.sensitive is not None or meta in ("sensitive_begin", "sensitive_end") or req.get("sensitive"):
             return await self._sensitive_handle(req, meta)
         if meta == "drain_events":
