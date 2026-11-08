@@ -54,6 +54,10 @@ from browser_harness.helpers import (
 
 SERVER = MCPServer("browser-harness")
 
+# Fleet fork: BH_MCP_TOOLS="browser_goto,browser_click,..." lists only those tools. Unset lists all of them.
+_ALLOWED = {t.strip() for t in os.environ.get("BH_MCP_TOOLS", "").split(",") if t.strip()} or None
+_DEFINED = set()
+
 
 def _normalize(value: Any) -> Any:
     """Recursively convert values to JSON-safe forms before json.dumps.
@@ -132,6 +136,9 @@ def _tool(fn):
         except Exception as exc:  # noqa: BLE001 -- browser failures must reach the MCP client.
             raise ToolError(str(exc)) from exc
 
+    _DEFINED.add(fn.__name__)
+    if _ALLOWED is not None and fn.__name__ not in _ALLOWED:
+        return wrapper
     return SERVER.tool(name=fn.__name__, description=fn.__doc__ or "")(wrapper)
 
 
@@ -293,6 +300,8 @@ def browser_stop_recording():
 
 def main() -> None:
     """Run the Browser Harness MCP server over stdio."""
+    if _ALLOWED is not None and (unknown := sorted(_ALLOWED - _DEFINED)):
+        raise SystemExit(f"BH_MCP_TOOLS names unknown tools: {', '.join(unknown)}")
     SERVER.run()
 
 

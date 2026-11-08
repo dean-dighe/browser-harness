@@ -106,6 +106,8 @@ def _process_start_time(pid):
 
 
 def _load_env():
+    if not paths.dotenv_enabled():
+        return
     repo_root = Path(__file__).resolve().parents[2]
     workspace = paths.workspace_dir()
     for p in (repo_root / ".env", workspace / ".env"):
@@ -522,9 +524,42 @@ def run_doctor_fix_snap():
     return 0
 
 
+def _strict_check_daemon(name, env=None):
+    """Strict mode reuses a live daemon only when it runs strict on the endpoint this caller configured."""
+    want = None
+    saved = {k: os.environ.get(k) for k in ("BU_CDP_URL", "BU_CDP_WS")}
+    try:
+        for k in saved:
+            if env and k in env:
+                os.environ[k] = env[k] or ""
+        want = paths.cdp_endpoint()
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    try:
+        s, token = ipc.connect(name or NAME, timeout=2.0)
+        try:
+            resp = ipc.request(s, token, {"meta": "ping"})
+        finally:
+            s.close()
+    except Exception:
+        resp = None
+    if not (isinstance(resp, dict) and resp.get("strict") is True and resp.get("browser_kind") == "cdp"
+            and want is not None and resp.get("endpoint") == want):
+        raise RuntimeError(
+            f"strict-cdp: daemon {name or NAME!r} is running with another configuration; stop it before strict use"
+        )
+
+
 def ensure_daemon(wait=None, name=None, env=None):
     """Idempotent. Self-heals stale daemon, closed Chrome (launches it), cold
     Chrome, and missing Allow on chrome://inspect."""
+    paths.strict_check_env(env)  # strict mode: one loopback CDP endpoint, no cloud, so never local discovery or launch
+    if paths.strict() and daemon_alive(name):
+        _strict_check_daemon(name, env)
     if daemon_alive(name):
         # Stale daemons accept connects AND reply to meta:* (pure Python) even when the
         # CDP WS to Chrome is dead — probe with a real CDP call and require "result".
@@ -535,6 +570,7 @@ def ensure_daemon(wait=None, name=None, env=None):
                 s, token = ipc.connect(name or NAME, timeout=3.0)
                 resp = ipc.request(s, token, {"method": "Target.getTargets", "params": {}})
                 if "result" in resp: return
+                if resp.get("error") == "sensitive-busy": return  # alive, serving a sign-in; never restart it
             except Exception:
                 pass
             if not last: time.sleep(0.5)
@@ -716,8 +752,11 @@ def require_existing_daemon(name=None):
     different local Chrome when that orchestrator-owned daemon dies.
     """
     daemon_name = name or NAME
+    paths.strict_check_env()  # strict mode: the same endpoint and identity checks as ensure_daemon, before any probe
     if not daemon_alive(daemon_name):
         raise RuntimeError(f"required daemon {daemon_name!r} is not running")
+    if paths.strict():
+        _strict_check_daemon(daemon_name)
     try:
         s, token = ipc.connect(daemon_name, timeout=3.0)
         try:
@@ -726,6 +765,8 @@ def require_existing_daemon(name=None):
             s.close()
     except Exception as exc:
         raise RuntimeError(f"required daemon {daemon_name!r} is unhealthy: {exc}") from exc
+    if isinstance(resp, dict) and resp.get("error") == "sensitive-busy":
+        return  # healthy, serving a sign-in: as ensure_daemon treats it; the caller's own requests get sensitive-busy
     if not isinstance(resp, dict) or "result" not in resp:
         raise RuntimeError(f"required daemon {daemon_name!r} failed its CDP health check")
 
@@ -884,6 +925,7 @@ def restart_daemon(name=None, require_clean=False):
 
 
 def _browser_use(path, method, body=None):
+    paths.strict_refuse("the Browser Use cloud")
     key = auth.get_browser_use_api_key()
     req = urllib.request.Request(
         f"{BU_API}{path}",
@@ -997,6 +1039,8 @@ def _resolve_profile_name(profile_name):
 def start_remote_daemon(name="remote", profileName=None, **create_kwargs):
     """Provision a Browser Use cloud browser and start a daemon attached to it.
 
+    Refused in strict mode (BH_STRICT_CDP=1).
+
     kwargs forwarded to `POST /browsers` (camelCase):
       profileId        — cloud profile UUID; start already-logged-in. Default: none (clean browser).
       profileName      — cloud profile name; resolved client-side to profileId via list_cloud_profiles().
@@ -1009,6 +1053,7 @@ def start_remote_daemon(name="remote", profileName=None, **create_kwargs):
     URL and opens it locally when a GUI is detected. Set BH_OPEN_LIVE_URL to
     0, false, no, or off (case-insensitive) to suppress only those display side
     effects; the returned URL remains present."""
+    paths.strict_refuse("the Browser Use cloud")
     show_live_view = _should_show_remote_live_view()
     if daemon_alive(name):
         raise RuntimeError(f"daemon {name!r} already alive -- restart_daemon({name!r}) first")
@@ -1147,7 +1192,9 @@ def _cache_write(data):
 
 
 def _latest_release_tag(force=False):
-    """Return latest PyPI version, or None. Cached for 24h to avoid hammering PyPI."""
+    """Return latest PyPI version, or None. Cached for 24h to avoid hammering PyPI. None in strict mode."""
+    if paths.strict():
+        return None
     cache = _cache_read()
     now = time.time()
     if not force and cache.get("tag") and now - cache.get("fetched_at", 0) < VERSION_CACHE_TTL:
@@ -1272,13 +1319,15 @@ def _profile_directory_args(base):
 
 
 def _launch_browser():
-    """Prefers the browser whose profile already has perm box checked.
+    """Prefers the browser whose profile already has perm box checked. Never in strict mode.
 
     Returns ``(process, profile)`` on success. ``process`` is available only
     when we launched the browser directly; ``profile`` is the user-data dir we
     expect that browser to use. The caller uses both to clean up a direct
     launch that never becomes reachable over CDP.
     """
+    if paths.strict():
+        return None
     import platform, shutil, subprocess
     from .daemon import PROFILES, remote_debugging_toggle_profiles
 

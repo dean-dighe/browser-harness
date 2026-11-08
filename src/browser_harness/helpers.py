@@ -17,8 +17,10 @@ AGENT_WORKSPACE = paths.workspace_dir()
 
 
 def _load_env():
-    paths = [REPO_ROOT / ".env", AGENT_WORKSPACE / ".env"]
-    for p in paths:
+    if not paths.dotenv_enabled():
+        return
+    env_files = [REPO_ROOT / ".env", AGENT_WORKSPACE / ".env"]
+    for p in env_files:
         if not p.exists():
             continue
         _load_env_file(p)
@@ -78,6 +80,117 @@ def cdp(method, session_id=None, _response_timeout=DEFAULT_IPC_RESPONSE_TIMEOUT_
 
 
 def drain_events():  return _send({"meta": "drain_events"})["events"]
+
+
+class SensitiveSession:
+    """A sensitive (sign-in) session on this daemon. Use `with sensitive() as s:`.
+
+    The daemon opens a tab of its own for it, records no events, serves no other client until it ends, allows only
+    Page.navigate, Page.getFrameTree, Runtime.evaluate and Input.* on that tab, and answers errors with the method name
+    only. It ends by itself after `max_seconds` (the tab is then closed). `keep=True` on end keeps the tab, for a
+    sign-in whose cookies are the point."""
+
+    def __init__(self, info):
+        self.token = info["token"]
+        self.target_id = info["target_id"]
+        self.version = info["version"]
+        self.guarded = info["guarded"] is True
+        self.max_seconds = info["max_seconds"]
+        self.keep = False
+
+    def cdp(self, method, _response_timeout=DEFAULT_IPC_RESPONSE_TIMEOUT_SECONDS, _frame_target=None, **params):
+        req = {"method": method, "params": params, "sensitive": self.token}
+        if _frame_target is not None:
+            req["frame_target"] = _frame_target
+        return _send(req, response_timeout=_response_timeout).get("result", {})
+
+    def state(self):
+        """{dialog: bool, frames: [out-of-process iframe target ids]} for the session's tab. No text."""
+        return _send({"meta": "sensitive_state", "sensitive": self.token})
+
+    def _world(self, frame_id, frame_target=None):
+        return self.cdp(
+            "Page.createIsolatedWorld", _frame_target=frame_target, frameId=frame_id, worldName="bh-sensitive",
+        )["executionContextId"]
+
+    def call(self, function_declaration, args=(), frame=None, timeout=DEFAULT_IPC_RESPONSE_TIMEOUT_SECONDS):
+        """Run `function_declaration` once, with `args` passed as call arguments (never put in script source), in a
+        fresh isolated world of the top document, or of the iframe matched by the `frame` selector in the top document.
+
+        The function runs in a world of its own, so page scripts cannot replace what it calls. A context that went stale
+        (the document navigated) fails; nothing is retried. Raises RuntimeError with a fixed reason on any failure:
+        `frame-missing`, `session-lost` or `call-failed`. Returns the function's value."""
+        top = self.cdp("Page.getFrameTree")["frameTree"]["frame"]["id"]
+        frame_target = None
+        if frame is None:
+            ctx = self._world(top)
+        else:
+            top_ctx = self._world(top)
+            r = self.cdp(
+                "Runtime.callFunctionOn", executionContextId=top_ctx,
+                functionDeclaration="function(s){const e=document.querySelector(s);"
+                                    "return e&&e.tagName==='IFRAME'?e:null}",
+                arguments=[{"value": frame}], returnByValue=False,
+            )
+            obj = (r.get("result") or {}).get("objectId")
+            if not obj:
+                raise RuntimeError("frame-missing")
+            try:
+                frame_id = (self.cdp("DOM.describeNode", objectId=obj).get("node") or {}).get("frameId")
+            finally:
+                try:
+                    self.cdp("Runtime.releaseObject", objectId=obj)
+                except RuntimeError:
+                    pass
+            if not frame_id:
+                raise RuntimeError("frame-missing")
+            if frame_id in self.state()["frames"]:
+                frame_target = frame_id  # out of process: its own session, its own frame tree
+            ctx = self._world(frame_id, frame_target)
+        try:
+            r = self.cdp(
+                "Runtime.callFunctionOn", _response_timeout=timeout, _frame_target=frame_target,
+                executionContextId=ctx, functionDeclaration=function_declaration,
+                arguments=[{"value": a} for a in args], returnByValue=True, awaitPromise=True,
+            )
+        except RuntimeError as e:
+            raise RuntimeError("session-lost" if str(e) == "session-lost" else "call-failed") from None
+        if r.get("exceptionDetails"):
+            raise RuntimeError("call-failed")
+        return (r.get("result") or {}).get("value")
+
+    def evaluate(self, expression, timeout=DEFAULT_IPC_RESPONSE_TIMEOUT_SECONDS):
+        """Evaluate in the session's tab and return the value. A thrown exception raises RuntimeError without its text."""
+        r = self.cdp("Runtime.evaluate", _response_timeout=timeout, expression=expression,
+                     returnByValue=True, awaitPromise=True)
+        if r.get("exceptionDetails"):
+            raise RuntimeError("Runtime.evaluate failed")
+        return (r.get("result") or {}).get("value")
+
+    def end(self):
+        if self.token is None:
+            return
+        token, self.token = self.token, None
+        _send({"meta": "sensitive_end", "sensitive": token, "keep": self.keep})
+
+
+class sensitive:
+    """Context manager: open a sensitive session, end it on exit (tab closed unless `session.keep` is set).
+
+    `max_seconds` (5 to 180, default 180) bounds the session if the caller never ends it."""
+
+    def __init__(self, max_seconds=None):
+        self.max_seconds = max_seconds
+
+    def __enter__(self):
+        if recording_dir() is not None:
+            raise RuntimeError("sensitive-refused: a recording is active")
+        self.session = SensitiveSession(_send({"meta": "sensitive_begin", "max_seconds": self.max_seconds}))
+        return self.session
+
+    def __exit__(self, *exc):
+        self.session.end()
+        return False
 
 
 def _js_snippet(expression, limit=160):
@@ -629,7 +742,8 @@ def http_get(url, headers=None, timeout=20.0):
     """Pure HTTP — no browser. Use for static pages / APIs. Wrap in ThreadPoolExecutor for bulk.
 
     When BROWSER_USE_API_KEY is set, routes through the fetch-use proxy (handles bot
-    detection, residential proxies, retries). Falls back to local urllib otherwise."""
+    detection, residential proxies, retries). Falls back to local urllib otherwise. Off in strict mode."""
+    paths.strict_refuse("http_get")
     if os.environ.get("BROWSER_USE_API_KEY"):
         try:
             from fetch_use import fetch_sync
@@ -651,6 +765,10 @@ from .recorder import start_recording, stop_recording, recording_dir
 
 
 def _load_agent_helpers():
+    # Fleet fork: agent_helpers.py runs arbitrary code and can replace any helper, so it loads only with
+    # BH_AGENT_HELPERS=1, and never in strict mode.
+    if not paths.env_flag("BH_AGENT_HELPERS") or paths.strict():
+        return
     p = AGENT_WORKSPACE / "agent_helpers.py"
     if not p.exists():
         return

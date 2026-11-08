@@ -180,6 +180,7 @@ def stored_auth_record(path: Path | None = None) -> dict | None:
 
 
 def get_browser_use_api_key() -> str:
+    paths.strict_refuse("the Browser Use cloud")
     env_key = os.environ.get("BROWSER_USE_API_KEY")
     if env_key:
         return env_key
@@ -207,6 +208,7 @@ def pkce_pair() -> tuple[str, str]:
 
 
 def start_browser_auth(*, open_url=True, timeout=AUTH_TIMEOUT_SECONDS) -> BrowserAuthStart:
+    paths.strict_refuse("the Browser Use cloud")
     verifier, challenge = pkce_pair()
     state = secrets.token_urlsafe(32)
     callback = PendingCallback(state=state)
@@ -296,6 +298,7 @@ def browser_login(*, open_url=True, json_output=False, timeout=AUTH_TIMEOUT_SECO
 
 
 def start_device_auth(*, open_url=True) -> DeviceAuthStart:
+    paths.strict_refuse("the Browser Use cloud")
     data = _post_json(
         f"{auth_base()}/cloud/cli-auth/device",
         {"client_id": client_id(), "device_name": os.environ.get("BH_DEVICE_NAME") or "browser-harness"},
@@ -425,6 +428,7 @@ def _callback_server(callback: PendingCallback) -> HTTPServer:
 
 
 def _post_json(url: str, payload: dict) -> dict:
+    paths.strict_refuse("the Browser Use cloud")
     req = urllib.request.Request(
         url,
         method="POST",

@@ -1,5 +1,5 @@
 """CDP WS holder + IPC relay (Unix socket on POSIX, TCP loopback on Windows). One daemon per BU_NAME."""
-import asyncio, json, os, platform, socket, sys, time, urllib.error, urllib.request
+import asyncio, json, os, platform, secrets, socket, sys, time, urllib.error, urllib.request
 from urllib.parse import urlparse
 from collections import deque
 from pathlib import Path
@@ -11,6 +11,8 @@ from cdp_use.client import CDPClient
 
 
 def _load_env():
+    if not paths.dotenv_enabled():
+        return
     repo_root = Path(__file__).resolve().parents[2]
     workspace = paths.workspace_dir()
     for p in (repo_root / ".env", workspace / ".env"):
@@ -127,6 +129,29 @@ TOGGLE_BOOT_GRACE = 12
 # Cancellation should make an in-flight CDP call finish immediately. Keep the
 # drain bounded anyway so shutdown fails closed if a client ignores cancellation.
 RECOVERY_CANCEL_DRAIN_TIMEOUT = 2
+# Fleet fork: sensitive session (sign-in). While one is open the daemon serves only its token holder, on one tab of its
+# own, with a short CDP allowlist; it records no events and returns no Chrome error text. See SENSITIVE_* below and
+# Daemon._sensitive_handle.
+SENSITIVE_VERSION = 1
+SENSITIVE_MAX_SECONDS = 180
+SENSITIVE_SETUP_SECONDS = 10  # opening the session's tab; past it the setup is undone and the begin fails
+SENSITIVE_METHODS = frozenset((
+    "Page.navigate",
+    "Page.getFrameTree",
+    "Page.createIsolatedWorld",
+    "Runtime.evaluate",
+    "Runtime.callFunctionOn",
+    "Runtime.releaseObject",
+    "DOM.describeNode",
+))
+# Methods the holder may send to an out-of-process iframe of the sensitive tab (frame_target in the request).
+SENSITIVE_FRAME_METHODS = frozenset((
+    "Page.createIsolatedWorld",
+    "Page.getFrameTree",
+    "Runtime.evaluate",
+    "Runtime.callFunctionOn",
+    "Runtime.releaseObject",
+))
 TAB_MARKER_JS = "if(!document.title.startsWith('\U0001F434'))document.title='\U0001F434 '+document.title"
 
 
@@ -233,6 +258,18 @@ def _safe_connection_label(url):
         return "<redacted-cdp-endpoint>"
 
 
+def _log_url(url):
+    """A page URL for the log. Strict mode keeps the origin only: paths and queries can carry codes and tokens."""
+    url = url or ""
+    if not paths.strict():
+        return url[:80]
+    try:
+        p = urlparse(url)
+        return f"{p.scheme}://{p.netloc}" if p.scheme in ("http", "https") else p.scheme + ":"
+    except ValueError:
+        return "<url>"
+
+
 async def _silent(coro):
     try:
         await coro
@@ -262,6 +299,7 @@ def _ws_from_devtools_active_port(http_url: str) -> str | None:
 
 
 def get_ws_url():
+    paths.strict_check_env()
     if url := os.environ.get("BU_CDP_WS"):
         return url
     if url := os.environ.get("BU_CDP_URL"):
@@ -271,14 +309,22 @@ def get_ws_url():
         deadline = time.time() + 30
         last_err = None
         base_url = url.rstrip("/")
+        opener = paths.no_redirect_opener() if paths.strict() else urllib.request.build_opener()
         while time.time() < deadline:
             try:
-                return json.loads(urllib.request.urlopen(f"{base_url}/json/version", timeout=5).read())["webSocketDebuggerUrl"]
+                ws = json.loads(opener.open(f"{base_url}/json/version", timeout=5).read())["webSocketDebuggerUrl"]
+                paths.strict_check_ws(ws)
+                return ws
+            except RuntimeError as e:
+                if str(e).startswith("strict-cdp"):
+                    raise  # a refusal, not a browser still starting: no retry
+                last_err = e
+                time.sleep(1)
             except urllib.error.HTTPError as e:
                 last_err = e
                 if e.code == 403:
                     raise RuntimeError("permission-blocked: Chrome is reachable, but the per-session Allow remote debugging popup has not been accepted")
-                if e.code == 404 and (ws := _ws_from_devtools_active_port(url)):
+                if e.code == 404 and not paths.strict() and (ws := _ws_from_devtools_active_port(url)):
                     return ws
                 time.sleep(1)
             except Exception as e:
@@ -346,6 +392,7 @@ def stop_remote(strict=False):
     global _REMOTE_STOPPED
     if not REMOTE_ID:
         return True
+    paths.strict_refuse("the Browser Use cloud")
     if _REMOTE_STOPPED:
         return True
     last_error = None
@@ -438,6 +485,13 @@ class Daemon:
         self.events = deque(maxlen=BUF)
         self.dialog = None
         self.stop = None  # asyncio.Event, set inside start()
+        self.sensitive = None  # {"token", "target_id", "session_id", "expiry_handle"} while a sensitive session is open
+        self._sensitive_lock = asyncio.Lock()  # one begin or end at a time
+        self._sensitive_sid = None  # the sensitive tab's session, set before auto-attach so no frame event is missed
+        self._sensitive_frames = {}  # out-of-process iframe targetId -> its flattened session id
+        self._sensitive_dialog = False
+        self._sensitive_pending = False  # set before a begin's first await: from then on ordinary requests are refused
+        self._ordinary = 0  # ordinary requests being served, which a begin waits out before it says guarded
 
     async def attach_first_page(self, replaces_session=None, enable_domains=True):
         """Attach to a real page (or any page). Sets self.session. Returns attached target or None."""
@@ -464,8 +518,14 @@ class Daemon:
                     pages_by_id = {t["targetId"]: t for t in refreshed if t["type"] == "page"}
                     page = pages_by_id.get(self.target_id) or pages_by_id.get(self.dedicated_target_id)
                     if page is None:
+                        # Fleet fork: a background tab in a shared window is document.hidden, so Chrome clamps its
+                        # timers (setTimeout(100) measured 818 ms) and SPAs and sign-in pages stall. A window of its
+                        # own, without taking focus, runs at full speed when Chrome is started with
+                        # --disable-backgrounding-occluded-windows --disable-background-timer-throttling
+                        # --disable-renderer-backgrounding (101 ms); without those flags Chrome still hides it as
+                        # occluded after about 2 s. Focus emulation (_emulate_focus) keeps visibilityState visible.
                         tid = (await self.cdp.send_raw(
-                            "Target.createTarget", {"url": "about:blank", "background": True}
+                            "Target.createTarget", {"url": "about:blank", "newWindow": True, "background": True}
                         ))["targetId"]
                         self.dedicated_target_id = tid
                         log(f"named daemon {NAME}: created dedicated tab ({tid})")
@@ -476,9 +536,10 @@ class Daemon:
             ))["sessionId"]
             self._record_session_replacement(replaces_session, self.session)
             self.target_id = tid
-            log(f"attached {tid} ({page.get('url','')[:80]}) session={self.session}")
+            log(f"attached {tid} ({_log_url(page.get('url'))}) session={self.session}")
             if enable_domains:
                 await self._enable_default_domains(self.session)
+            await self._emulate_focus(self.session)
             return page
 
         pages = [t for t in targets if is_real_page(t)]
@@ -509,7 +570,7 @@ class Daemon:
         ))["sessionId"]
         self._record_session_replacement(replaces_session, self.session)
         self.target_id = pages[0]["targetId"]
-        log(f"attached {pages[0]['targetId']} ({pages[0].get('url','')[:80]}) session={self.session}")
+        log(f"attached {pages[0]['targetId']} ({_log_url(pages[0].get('url'))}) session={self.session}")
         if take_over:
             try:
                 await self.cdp.send_raw("Page.navigate", {"url": "about:blank"}, session_id=self.session)
@@ -561,6 +622,16 @@ class Daemon:
             except Exception as e:
                 log(f"enable {d} on {session_id}: {e}")
         await asyncio.gather(*(enable_one(d) for d in ("Page", "DOM", "Runtime", "Network")))
+
+    async def _emulate_focus(self, session_id):
+        """Report the page as focused and visible to its scripts, so a page left in the background does not pause."""
+        try:
+            await asyncio.wait_for(
+                self.cdp.send_raw("Emulation.setFocusEmulationEnabled", {"enabled": True}, session_id=session_id),
+                timeout=2,
+            )
+        except Exception as e:
+            log(f"focus emulation on {session_id}: {e}")
 
     def _record_session_replacement(self, stale_session, replacement_session):
         """Remember which recovered session still controls the same tab."""
@@ -624,6 +695,25 @@ class Daemon:
         )))
 
     def _record_event(self, method, params, session_id=None):
+        if self._sensitive_pending and self._sensitive_sid is None:
+            return  # a session is being opened: nothing is kept from here on either
+        if self._sensitive_sid is not None:
+            # Nothing is kept while a sensitive session is open: Network events carry posted form bodies, dialogs and
+            # console events can carry typed values. The browser still gets the event; only the buffer skips it. Two
+            # facts are kept for the holder, without text: which iframes of the tab run out of process, and whether a
+            # JS dialog is open.
+            if session_id == self._sensitive_sid:
+                if method == "Target.attachedToTarget" and (params.get("targetInfo") or {}).get("type") == "iframe":
+                    self._sensitive_frames[params["targetInfo"]["targetId"]] = params["sessionId"]
+                elif method == "Target.detachedFromTarget":
+                    self._sensitive_frames = {
+                        t: s for t, s in self._sensitive_frames.items() if s != params.get("sessionId")
+                    }
+                elif method == "Page.javascriptDialogOpening":
+                    self._sensitive_dialog = True
+                elif method == "Page.javascriptDialogClosed":
+                    self._sensitive_dialog = False
+            return
         self.events.append({"method": method, "params": params, "session_id": session_id})
         if method == "Page.javascriptDialogOpening":
             self.dialog = params
@@ -663,6 +753,16 @@ class Daemon:
         self.cdp._event_registry.handle_event = tap
 
     async def handle(self, req):
+        meta = req.get("meta") if isinstance(req, dict) else None
+        if meta == "ping" or meta in ("sensitive_begin", "sensitive_end", "sensitive_state") or (isinstance(req, dict) and req.get("sensitive")):
+            return await self._handle(req)
+        self._ordinary += 1
+        try:
+            return await self._handle(req)
+        finally:
+            self._ordinary -= 1
+
+    async def _handle(self, req):
         # Token guard for Windows TCP loopback: any local process can otherwise
         # connect and issue CDP commands. expected_token() is None on POSIX so
         # this check is a no-op there (AF_UNIX + chmod 600 is the boundary).
@@ -674,7 +774,17 @@ class Daemon:
         # daemon and not an unrelated process that reused our port post-crash.
         # `pid` lets restart_daemon() verify the live daemon's identity before
         # signaling — protects against SIGTERM-by-stale-pid-file after PID reuse.
-        if meta == "ping":        return {"pong": True, "pid": os.getpid(), "browser_kind": BROWSER_KIND}
+        if meta == "ping":
+            return {"pong": True, "pid": os.getpid(), "browser_kind": BROWSER_KIND,
+                    "strict": paths.strict(), "endpoint": paths.cdp_endpoint()}
+        if meta == "shutdown" and self.sensitive is not None:
+            # A deliberate stop ends the sign-in attempt; its tab is closed before the daemon goes. If Chrome does not
+            # confirm the close, the daemon stays up and keeps the guards.
+            async with self._sensitive_lock:
+                if not await self._sensitive_end(close=True):
+                    return {"error": "sensitive-end-failed"}
+        if self.sensitive is not None or self._sensitive_pending or meta in ("sensitive_begin", "sensitive_end") or req.get("sensitive"):
+            return await self._sensitive_handle(req, meta)
         if meta == "drain_events":
             out = list(self.events); self.events.clear()
             return {"events": out}
@@ -808,6 +918,162 @@ class Daemon:
             return {"error": msg}
 
 
+    async def _sensitive_begin(self, max_seconds=None):
+        if self._shutting_down:
+            return {"error": "daemon is shutting down"}
+        made = {}  # what the setup has made so far, for the cleanup
+
+        async def setup():
+            made["tid"] = (await self.cdp.send_raw(
+                "Target.createTarget", {"url": "about:blank", "newWindow": True, "background": True}
+            ))["targetId"]
+            made["sid"] = (await self.cdp.send_raw("Target.attachToTarget", {"targetId": made["tid"], "flatten": True}))["sessionId"]
+            sid = made["sid"]
+            self._sensitive_sid, self._sensitive_frames, self._sensitive_dialog = sid, {}, False
+            # Page and Runtime only: no Network domain, so no request bodies reach this process at all.
+            for domain in ("Page", "Runtime"):
+                await self.cdp.send_raw(f"{domain}.enable", session_id=sid)
+            await self._emulate_focus(sid)
+            # Out-of-process iframes (a sign-in form on another site) attach as their own sessions.
+            await self.cdp.send_raw(
+                "Target.setAutoAttach",
+                {"autoAttach": True, "waitForDebuggerOnStart": False, "flatten": True},
+                session_id=sid,
+            )
+
+        async def undo():
+            self._sensitive_sid = None
+            self._sensitive_frames = {}
+            if made.get("tid"):
+                try:
+                    await asyncio.wait_for(self.cdp.send_raw("Target.closeTarget", {"targetId": made["tid"]}), timeout=3)
+                except Exception:
+                    pass
+
+        try:
+            # A Chrome that stops answering mid-setup must not hold the barrier (and every other client) for long.
+            await asyncio.wait_for(setup(), timeout=SENSITIVE_SETUP_SECONDS)
+        except asyncio.CancelledError:
+            await asyncio.shield(undo())
+            raise
+        except Exception:
+            await undo()
+            return {"error": "sensitive-begin failed"}
+        tid = made["tid"]
+        sid = made["sid"]
+        token = secrets.token_urlsafe(32)
+        self.events.clear()
+        self.dialog = None
+        try:
+            limit = min(SENSITIVE_MAX_SECONDS, max(5, int(max_seconds or SENSITIVE_MAX_SECONDS)))
+        except (TypeError, ValueError):
+            limit = SENSITIVE_MAX_SECONDS
+        expiry = asyncio.get_running_loop().call_later(limit, lambda: asyncio.create_task(self._sensitive_expire(token)))
+        self.sensitive = {"token": token, "target_id": tid, "session_id": sid, "expiry_handle": expiry}
+        log("sensitive session opened")
+        return {"token": token, "target_id": tid, "version": SENSITIVE_VERSION, "guarded": True,
+                "max_seconds": limit}
+
+    async def _sensitive_expire(self, token):
+        async with self._sensitive_lock:
+            if self.sensitive is not None and self.sensitive["token"] == token:
+                await self._sensitive_end(close=True)
+
+    async def _sensitive_end(self, close):
+        """End the open sensitive session. Callers hold _sensitive_lock, except shutdown. True when it ended.
+
+        The guards (one token holder, no event buffer) stay on until Chrome confirms the tab closed or the session
+        detached. A target or session Chrome no longer knows counts as gone. On any other failure the session stays
+        open and refuses everyone, the holder included, and the close is tried again every few seconds."""
+        state = self.sensitive
+        if state is None:
+            return True
+        state["ending"] = True  # the holder's own requests are refused from here on
+        method, params = (
+            ("Target.closeTarget", {"targetId": state["target_id"]}) if close
+            else ("Target.detachFromTarget", {"sessionId": state["session_id"]})
+        )
+        try:
+            await asyncio.wait_for(self.cdp.send_raw(method, params), timeout=3)
+            done = True
+        except Exception as e:
+            text = str(e)
+            done = "No target with given id" in text or "Session with given id not found" in text
+        if not done:
+            log(f"sensitive session end: {method} failed; guards kept, retrying")
+            state["expiry_handle"].cancel()
+            token = state["token"]
+            state["expiry_handle"] = asyncio.get_running_loop().call_later(
+                5, lambda: asyncio.create_task(self._sensitive_expire(token))
+            )
+            return False
+        state["expiry_handle"].cancel()
+        self.sensitive = None
+        self._sensitive_sid, self._sensitive_frames, self._sensitive_dialog = None, {}, False
+        self.events.clear()
+        self.dialog = None
+        log("sensitive session closed" + (" (tab closed)" if close else ""))
+        return True
+
+    async def _sensitive_handle(self, req, meta):
+        """All requests while a sensitive session is open, and the begin/end verbs.
+
+        Only the token holder is served; everyone else gets `sensitive-busy`. The holder is limited to
+        SENSITIVE_METHODS on the session's own tab. Errors carry the method name only, never Chrome's message (it can
+        echo an expression or typed text), and a lost session is not recovered or replayed."""
+        state = self.sensitive
+        if meta == "sensitive_begin":
+            if self._sensitive_lock.locked():
+                return {"error": "sensitive-busy"}
+            async with self._sensitive_lock:
+                if self.sensitive is not None:
+                    return {"error": "sensitive-busy"}
+                # The barrier goes up before any await: new ordinary requests are refused from here, and the ones already
+                # being served are waited out (at most 5 s) before the session's tab is made.
+                self._sensitive_pending = True
+                try:
+                    until = time.monotonic() + 5
+                    while self._ordinary > 0:
+                        if time.monotonic() >= until:
+                            return {"error": "sensitive-busy"}
+                        await asyncio.sleep(0.02)
+                    return await self._sensitive_begin(req.get("max_seconds"))
+                finally:
+                    self._sensitive_pending = False
+        if state is None:
+            return {"error": "sensitive-busy" if self._sensitive_pending else "sensitive-not-open"}
+        if not secrets.compare_digest(str(req.get("sensitive") or ""), state["token"]):
+            return {"error": "sensitive-busy"}
+        if meta == "sensitive_end":
+            async with self._sensitive_lock:
+                ended = await self._sensitive_end(close=not req.get("keep"))
+            return {"ok": True} if ended else {"error": "sensitive-end-failed"}
+        if state.get("ending"):
+            return {"error": "sensitive-busy"}
+        if meta == "sensitive_state":
+            return {"dialog": self._sensitive_dialog, "frames": sorted(self._sensitive_frames)}
+        if meta:
+            return {"error": "sensitive-refused"}
+        method = req.get("method")
+        frame_target = req.get("frame_target")
+        if frame_target is not None:
+            session = self._sensitive_frames.get(frame_target)
+            if session is None:
+                return {"error": "session-lost"}
+            if method not in SENSITIVE_FRAME_METHODS:
+                return {"error": "sensitive-refused"}
+        else:
+            session = state["session_id"]
+            if method not in SENSITIVE_METHODS:
+                return {"error": "sensitive-refused"}
+        try:
+            return {"result": await self.cdp.send_raw(method, req.get("params") or {}, session_id=session)}
+        except Exception as e:
+            if "Session with given id not found" in str(e) or "No target with given id" in str(e):
+                return {"error": "session-lost"}
+            return {"error": f"{method} failed"}
+
+
 async def serve(d):
     async def handler(reader, writer):
         try:
@@ -841,6 +1107,9 @@ async def serve(d):
         # A server crash/cancellation does not pass through meta=shutdown.
         # Establish the same recovery barrier before touching owned targets.
         d._shutting_down = True
+        if d.sensitive is not None and d.cdp:
+            if not await d._sensitive_end(close=True):  # never leave a tab with typed values behind
+                log("sensitive tab not confirmed closed at exit")
         recoveries_drained = await d._cancel_and_drain_recoveries()
         # Named non-cloud daemons create one dedicated background tab. Shutdown
         # has blocked new recovery and drained active recovery before setting
@@ -864,8 +1133,16 @@ async def serve(d):
 
 
 async def main():
+    import signal
     d = Daemon()
     await d.start()
+    # SIGTERM and SIGINT run serve()'s cleanup (sensitive and dedicated tabs closed) instead of killing it mid-way.
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, d.stop.set)
+        except (NotImplementedError, RuntimeError):
+            pass  # Windows
     await serve(d)
 
 

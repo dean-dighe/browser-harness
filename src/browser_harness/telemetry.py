@@ -80,9 +80,10 @@ def _version() -> str:
 
 
 def _env_disabled() -> bool:
-    # Fleet fork: telemetry is off unless one of DISABLE_ENVS is set to an explicit yes. Fleet browsers drive signed-in
-    # client systems; nothing about them leaves the Mac by default.
-    return not any((os.environ.get(name) or "").lower() in {"1", "true", "yes", "on"} for name in DISABLE_ENVS)
+    # Fleet fork: telemetry is off unless BH_TELEMETRY=1. Fleet browsers drive signed-in client systems; nothing about
+    # them leaves the Mac by default. BROWSER_HARNESS_TELEMETRY and ANONYMIZED_TELEMETRY (often "true" in browser-use
+    # setups) never turn it on.
+    return paths.strict() or (os.environ.get("BH_TELEMETRY") or "").strip() != "1"
 
 
 def _valid_install_id(raw) -> bool:
