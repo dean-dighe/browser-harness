@@ -82,6 +82,62 @@ def cdp(method, session_id=None, _response_timeout=DEFAULT_IPC_RESPONSE_TIMEOUT_
 def drain_events():  return _send({"meta": "drain_events"})["events"]
 
 
+class SensitiveSession:
+    """A sensitive (sign-in) session on this daemon. Use `with sensitive() as s:`.
+
+    The daemon opens a tab of its own for it, records no events, serves no other client until it ends, allows only
+    Page.navigate, Page.getFrameTree, Runtime.evaluate and Input.* on that tab, and answers errors with the method name
+    only. It ends by itself after `max_seconds` (the tab is then closed). `keep=True` on end keeps the tab, for a
+    sign-in whose cookies are the point."""
+
+    def __init__(self, info):
+        self.token = info["token"]
+        self.target_id = info["target_id"]
+        self.version = info["version"]
+        self.guarded = info["guarded"] is True
+        self.max_seconds = info["max_seconds"]
+        self.keep = False
+
+    def cdp(self, method, _response_timeout=DEFAULT_IPC_RESPONSE_TIMEOUT_SECONDS, **params):
+        return _send(
+            {"method": method, "params": params, "sensitive": self.token},
+            response_timeout=_response_timeout,
+        ).get("result", {})
+
+    def evaluate(self, expression, timeout=DEFAULT_IPC_RESPONSE_TIMEOUT_SECONDS):
+        """Evaluate in the session's tab and return the value. A thrown exception raises RuntimeError without its text."""
+        r = self.cdp("Runtime.evaluate", _response_timeout=timeout, expression=expression,
+                     returnByValue=True, awaitPromise=True)
+        if r.get("exceptionDetails"):
+            raise RuntimeError("Runtime.evaluate failed")
+        return (r.get("result") or {}).get("value")
+
+    def end(self):
+        if self.token is None:
+            return
+        token, self.token = self.token, None
+        _send({"meta": "sensitive_end", "sensitive": token, "keep": self.keep})
+
+
+class sensitive:
+    """Context manager: open a sensitive session, end it on exit (tab closed unless `session.keep` is set).
+
+    `max_seconds` (5 to 180, default 180) bounds the session if the caller never ends it."""
+
+    def __init__(self, max_seconds=None):
+        self.max_seconds = max_seconds
+
+    def __enter__(self):
+        if recording_dir() is not None:
+            raise RuntimeError("sensitive-refused: a recording is active")
+        self.session = SensitiveSession(_send({"meta": "sensitive_begin", "max_seconds": self.max_seconds}))
+        return self.session
+
+    def __exit__(self, *exc):
+        self.session.end()
+        return False
+
+
 def _js_snippet(expression, limit=160):
     snippet = expression.strip().replace("\n", "\\n")
     return snippet[:limit - 3] + "..." if len(snippet) > limit else snippet

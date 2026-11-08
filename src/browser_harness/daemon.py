@@ -1,5 +1,5 @@
 """CDP WS holder + IPC relay (Unix socket on POSIX, TCP loopback on Windows). One daemon per BU_NAME."""
-import asyncio, json, os, platform, socket, sys, time, urllib.error, urllib.request
+import asyncio, json, os, platform, secrets, socket, sys, time, urllib.error, urllib.request
 from urllib.parse import urlparse
 from collections import deque
 from pathlib import Path
@@ -129,6 +129,19 @@ TOGGLE_BOOT_GRACE = 12
 # Cancellation should make an in-flight CDP call finish immediately. Keep the
 # drain bounded anyway so shutdown fails closed if a client ignores cancellation.
 RECOVERY_CANCEL_DRAIN_TIMEOUT = 2
+# Fleet fork: sensitive session (sign-in). While one is open the daemon serves only its token holder, on one tab of its
+# own, with a short CDP allowlist; it records no events and returns no Chrome error text. See SENSITIVE_* below and
+# Daemon._sensitive_handle.
+SENSITIVE_VERSION = 1
+SENSITIVE_MAX_SECONDS = 180
+SENSITIVE_METHODS = frozenset((
+    "Page.navigate",
+    "Page.getFrameTree",
+    "Runtime.evaluate",
+    "Input.insertText",
+    "Input.dispatchKeyEvent",
+    "Input.dispatchMouseEvent",
+))
 TAB_MARKER_JS = "if(!document.title.startsWith('\U0001F434'))document.title='\U0001F434 '+document.title"
 
 
@@ -442,6 +455,7 @@ class Daemon:
         self.events = deque(maxlen=BUF)
         self.dialog = None
         self.stop = None  # asyncio.Event, set inside start()
+        self.sensitive = None  # {"token", "target_id", "session_id", "expiry_handle"} while a sensitive session is open
 
     async def attach_first_page(self, replaces_session=None, enable_domains=True):
         """Attach to a real page (or any page). Sets self.session. Returns attached target or None."""
@@ -631,6 +645,10 @@ class Daemon:
         )))
 
     def _record_event(self, method, params, session_id=None):
+        if self.sensitive is not None:
+            # Nothing is kept while a sensitive session is open: Network events carry posted form bodies, dialogs and
+            # console events can carry typed values. The browser still gets the event; only the buffer skips it.
+            return
         self.events.append({"method": method, "params": params, "session_id": session_id})
         if method == "Page.javascriptDialogOpening":
             self.dialog = params
@@ -682,6 +700,8 @@ class Daemon:
         # `pid` lets restart_daemon() verify the live daemon's identity before
         # signaling — protects against SIGTERM-by-stale-pid-file after PID reuse.
         if meta == "ping":        return {"pong": True, "pid": os.getpid(), "browser_kind": BROWSER_KIND}
+        if self.sensitive is not None or meta in ("sensitive_begin", "sensitive_end") or req.get("sensitive"):
+            return await self._sensitive_handle(req, meta)
         if meta == "drain_events":
             out = list(self.events); self.events.clear()
             return {"events": out}
@@ -813,6 +833,84 @@ class Daemon:
                 finally:
                     self._finish_recovery(recovery_task)
             return {"error": msg}
+
+
+    async def _sensitive_begin(self, max_seconds=None):
+        if self._shutting_down:
+            return {"error": "daemon is shutting down"}
+        try:
+            tid = (await self.cdp.send_raw(
+                "Target.createTarget", {"url": "about:blank", "newWindow": True, "background": True}
+            ))["targetId"]
+            sid = (await self.cdp.send_raw("Target.attachToTarget", {"targetId": tid, "flatten": True}))["sessionId"]
+            # Page and Runtime only: no Network domain, so no request bodies reach this process at all.
+            for domain in ("Page", "Runtime"):
+                await self.cdp.send_raw(f"{domain}.enable", session_id=sid)
+        except Exception:
+            return {"error": "sensitive-begin failed"}
+        token = secrets.token_urlsafe(32)
+        self.events.clear()
+        self.dialog = None
+        try:
+            limit = min(SENSITIVE_MAX_SECONDS, max(5, int(max_seconds or SENSITIVE_MAX_SECONDS)))
+        except (TypeError, ValueError):
+            limit = SENSITIVE_MAX_SECONDS
+        expiry = asyncio.get_running_loop().call_later(
+            limit, lambda: asyncio.create_task(self._sensitive_end(close=True))
+        )
+        self.sensitive = {"token": token, "target_id": tid, "session_id": sid, "expiry_handle": expiry}
+        log("sensitive session opened")
+        return {"token": token, "target_id": tid, "version": SENSITIVE_VERSION, "guarded": True,
+                "max_seconds": limit}
+
+    async def _sensitive_end(self, close):
+        state, self.sensitive = self.sensitive, None
+        if state is None:
+            return
+        state["expiry_handle"].cancel()
+        if close:
+            try:
+                await self.cdp.send_raw("Target.closeTarget", {"targetId": state["target_id"]})
+            except Exception:
+                pass
+        else:
+            try:
+                await self.cdp.send_raw("Target.detachFromTarget", {"sessionId": state["session_id"]})
+            except Exception:
+                pass
+        self.events.clear()
+        self.dialog = None
+        log("sensitive session closed" + (" (tab closed)" if close else ""))
+
+    async def _sensitive_handle(self, req, meta):
+        """All requests while a sensitive session is open, and the begin/end verbs.
+
+        Only the token holder is served; everyone else gets `sensitive-busy`. The holder is limited to
+        SENSITIVE_METHODS on the session's own tab. Errors carry the method name only, never Chrome's message (it can
+        echo an expression or typed text), and a lost session is not recovered or replayed."""
+        state = self.sensitive
+        if meta == "sensitive_begin":
+            if state is not None:
+                return {"error": "sensitive-busy"}
+            return await self._sensitive_begin(req.get("max_seconds"))
+        if state is None:
+            return {"error": "sensitive-not-open"}
+        if not secrets.compare_digest(str(req.get("sensitive") or ""), state["token"]):
+            return {"error": "sensitive-busy"}
+        if meta == "sensitive_end":
+            await self._sensitive_end(close=not req.get("keep"))
+            return {"ok": True}
+        if meta:
+            return {"error": "sensitive-refused"}
+        method = req.get("method")
+        if method not in SENSITIVE_METHODS:
+            return {"error": "sensitive-refused"}
+        try:
+            return {"result": await self.cdp.send_raw(method, req.get("params") or {}, session_id=state["session_id"])}
+        except Exception as e:
+            if "Session with given id not found" in str(e) or "No target with given id" in str(e):
+                return {"error": "session-lost"}
+            return {"error": f"{method} failed"}
 
 
 async def serve(d):
