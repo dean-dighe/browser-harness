@@ -17,8 +17,10 @@ AGENT_WORKSPACE = paths.workspace_dir()
 
 
 def _load_env():
-    paths = [REPO_ROOT / ".env", AGENT_WORKSPACE / ".env"]
-    for p in paths:
+    if not paths.dotenv_enabled():
+        return
+    env_files = [REPO_ROOT / ".env", AGENT_WORKSPACE / ".env"]
+    for p in env_files:
         if not p.exists():
             continue
         _load_env_file(p)

@@ -11,6 +11,8 @@ from cdp_use.client import CDPClient
 
 
 def _load_env():
+    if not paths.dotenv_enabled():
+        return
     repo_root = Path(__file__).resolve().parents[2]
     workspace = paths.workspace_dir()
     for p in (repo_root / ".env", workspace / ".env"):
