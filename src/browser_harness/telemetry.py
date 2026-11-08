@@ -80,7 +80,9 @@ def _version() -> str:
 
 
 def _env_disabled() -> bool:
-    return any((os.environ.get(name) or "").lower() in {"0", "false", "no", "off"} for name in DISABLE_ENVS)
+    # Fleet fork: telemetry is off unless one of DISABLE_ENVS is set to an explicit yes. Fleet browsers drive signed-in
+    # client systems; nothing about them leaves the Mac by default.
+    return not any((os.environ.get(name) or "").lower() in {"1", "true", "yes", "on"} for name in DISABLE_ENVS)
 
 
 def _valid_install_id(raw) -> bool:
