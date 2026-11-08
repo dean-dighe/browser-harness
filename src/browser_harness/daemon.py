@@ -1009,8 +1009,16 @@ async def serve(d):
 
 
 async def main():
+    import signal
     d = Daemon()
     await d.start()
+    # SIGTERM and SIGINT run serve()'s cleanup (sensitive and dedicated tabs closed) instead of killing it mid-way.
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, d.stop.set)
+        except (NotImplementedError, RuntimeError):
+            pass  # Windows
     await serve(d)
 
 
