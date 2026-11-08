@@ -468,8 +468,11 @@ class Daemon:
                     pages_by_id = {t["targetId"]: t for t in refreshed if t["type"] == "page"}
                     page = pages_by_id.get(self.target_id) or pages_by_id.get(self.dedicated_target_id)
                     if page is None:
+                        # Fleet fork: a background tab in a shared window is document.hidden, so Chrome clamps its
+                        # timers to 1 s and SPAs and sign-in pages stall. A window of its own stays visible without
+                        # taking focus (measured: setTimeout(100) 101 ms here, 818 ms in a background tab).
                         tid = (await self.cdp.send_raw(
-                            "Target.createTarget", {"url": "about:blank", "background": True}
+                            "Target.createTarget", {"url": "about:blank", "newWindow": True, "background": True}
                         ))["targetId"]
                         self.dedicated_target_id = tid
                         log(f"named daemon {NAME}: created dedicated tab ({tid})")
