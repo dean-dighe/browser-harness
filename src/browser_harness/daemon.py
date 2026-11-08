@@ -939,23 +939,40 @@ class Daemon:
                 await self._sensitive_end(close=True)
 
     async def _sensitive_end(self, close):
-        """End the open sensitive session. Callers hold _sensitive_lock, except shutdown."""
-        state, self.sensitive = self.sensitive, None
-        self._sensitive_sid, self._sensitive_frames, self._sensitive_dialog = None, {}, False
+        """End the open sensitive session. Callers hold _sensitive_lock, except shutdown. True when it ended.
+
+        The guards (one token holder, no event buffer) stay on until Chrome confirms the tab closed or the session
+        detached. A target or session Chrome no longer knows counts as gone. On any other failure the session stays
+        open and refuses everyone, the holder included, and the close is tried again every few seconds."""
+        state = self.sensitive
         if state is None:
-            return
-        state["expiry_handle"].cancel()
+            return True
+        state["ending"] = True  # the holder's own requests are refused from here on
         method, params = (
             ("Target.closeTarget", {"targetId": state["target_id"]}) if close
             else ("Target.detachFromTarget", {"sessionId": state["session_id"]})
         )
         try:
             await asyncio.wait_for(self.cdp.send_raw(method, params), timeout=3)
-        except Exception:
-            log(f"sensitive session end: {method} failed")
+            done = True
+        except Exception as e:
+            text = str(e)
+            done = "No target with given id" in text or "Session with given id not found" in text
+        if not done:
+            log(f"sensitive session end: {method} failed; guards kept, retrying")
+            state["expiry_handle"].cancel()
+            token = state["token"]
+            state["expiry_handle"] = asyncio.get_running_loop().call_later(
+                5, lambda: asyncio.create_task(self._sensitive_expire(token))
+            )
+            return False
+        state["expiry_handle"].cancel()
+        self.sensitive = None
+        self._sensitive_sid, self._sensitive_frames, self._sensitive_dialog = None, {}, False
         self.events.clear()
         self.dialog = None
         log("sensitive session closed" + (" (tab closed)" if close else ""))
+        return True
 
     async def _sensitive_handle(self, req, meta):
         """All requests while a sensitive session is open, and the begin/end verbs.
@@ -977,8 +994,10 @@ class Daemon:
             return {"error": "sensitive-busy"}
         if meta == "sensitive_end":
             async with self._sensitive_lock:
-                await self._sensitive_end(close=not req.get("keep"))
-            return {"ok": True}
+                ended = await self._sensitive_end(close=not req.get("keep"))
+            return {"ok": True} if ended else {"error": "sensitive-end-failed"}
+        if state.get("ending"):
+            return {"error": "sensitive-busy"}
         if meta == "sensitive_state":
             return {"dialog": self._sensitive_dialog, "frames": sorted(self._sensitive_frames)}
         if meta:
@@ -1037,7 +1056,8 @@ async def serve(d):
         # Establish the same recovery barrier before touching owned targets.
         d._shutting_down = True
         if d.sensitive is not None and d.cdp:
-            await d._sensitive_end(close=True)  # never leave a tab with typed values behind
+            if not await d._sensitive_end(close=True):  # never leave a tab with typed values behind
+                log("sensitive tab not confirmed closed at exit")
         recoveries_drained = await d._cancel_and_drain_recoveries()
         # Named non-cloud daemons create one dedicated background tab. Shutdown
         # has blocked new recovery and drained active recovery before setting
