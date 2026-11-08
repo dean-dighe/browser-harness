@@ -248,6 +248,18 @@ def _safe_connection_label(url):
         return "<redacted-cdp-endpoint>"
 
 
+def _log_url(url):
+    """A page URL for the log. Strict mode keeps the origin only: paths and queries can carry codes and tokens."""
+    url = url or ""
+    if not paths.strict():
+        return url[:80]
+    try:
+        p = urlparse(url)
+        return f"{p.scheme}://{p.netloc}" if p.scheme in ("http", "https") else p.scheme + ":"
+    except ValueError:
+        return "<url>"
+
+
 async def _silent(coro):
     try:
         await coro
@@ -497,7 +509,7 @@ class Daemon:
             ))["sessionId"]
             self._record_session_replacement(replaces_session, self.session)
             self.target_id = tid
-            log(f"attached {tid} ({page.get('url','')[:80]}) session={self.session}")
+            log(f"attached {tid} ({_log_url(page.get('url'))}) session={self.session}")
             if enable_domains:
                 await self._enable_default_domains(self.session)
             return page
@@ -530,7 +542,7 @@ class Daemon:
         ))["sessionId"]
         self._record_session_replacement(replaces_session, self.session)
         self.target_id = pages[0]["targetId"]
-        log(f"attached {pages[0]['targetId']} ({pages[0].get('url','')[:80]}) session={self.session}")
+        log(f"attached {pages[0]['targetId']} ({_log_url(pages[0].get('url'))}) session={self.session}")
         if take_over:
             try:
                 await self.cdp.send_raw("Page.navigate", {"url": "about:blank"}, session_id=self.session)
