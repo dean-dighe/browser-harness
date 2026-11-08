@@ -495,8 +495,11 @@ class Daemon:
                     page = pages_by_id.get(self.target_id) or pages_by_id.get(self.dedicated_target_id)
                     if page is None:
                         # Fleet fork: a background tab in a shared window is document.hidden, so Chrome clamps its
-                        # timers to 1 s and SPAs and sign-in pages stall. A window of its own stays visible without
-                        # taking focus (measured: setTimeout(100) 101 ms here, 818 ms in a background tab).
+                        # timers (setTimeout(100) measured 818 ms) and SPAs and sign-in pages stall. A window of its
+                        # own, without taking focus, runs at full speed when Chrome is started with
+                        # --disable-backgrounding-occluded-windows --disable-background-timer-throttling
+                        # --disable-renderer-backgrounding (101 ms); without those flags Chrome still hides it as
+                        # occluded after about 2 s. Focus emulation (_emulate_focus) keeps visibilityState visible.
                         tid = (await self.cdp.send_raw(
                             "Target.createTarget", {"url": "about:blank", "newWindow": True, "background": True}
                         ))["targetId"]
@@ -512,6 +515,7 @@ class Daemon:
             log(f"attached {tid} ({_log_url(page.get('url'))}) session={self.session}")
             if enable_domains:
                 await self._enable_default_domains(self.session)
+            await self._emulate_focus(self.session)
             return page
 
         pages = [t for t in targets if is_real_page(t)]
@@ -594,6 +598,16 @@ class Daemon:
             except Exception as e:
                 log(f"enable {d} on {session_id}: {e}")
         await asyncio.gather(*(enable_one(d) for d in ("Page", "DOM", "Runtime", "Network")))
+
+    async def _emulate_focus(self, session_id):
+        """Report the page as focused and visible to its scripts, so a page left in the background does not pause."""
+        try:
+            await asyncio.wait_for(
+                self.cdp.send_raw("Emulation.setFocusEmulationEnabled", {"enabled": True}, session_id=session_id),
+                timeout=2,
+            )
+        except Exception as e:
+            log(f"focus emulation on {session_id}: {e}")
 
     def _record_session_replacement(self, stale_session, replacement_session):
         """Remember which recovered session still controls the same tab."""
@@ -858,6 +872,7 @@ class Daemon:
             # Page and Runtime only: no Network domain, so no request bodies reach this process at all.
             for domain in ("Page", "Runtime"):
                 await self.cdp.send_raw(f"{domain}.enable", session_id=sid)
+            await self._emulate_focus(sid)
         except Exception:
             return {"error": "sensitive-begin failed"}
         token = secrets.token_urlsafe(32)
