@@ -752,8 +752,11 @@ def require_existing_daemon(name=None):
     different local Chrome when that orchestrator-owned daemon dies.
     """
     daemon_name = name or NAME
+    paths.strict_check_env()  # strict mode: the same endpoint and identity checks as ensure_daemon, before any probe
     if not daemon_alive(daemon_name):
         raise RuntimeError(f"required daemon {daemon_name!r} is not running")
+    if paths.strict():
+        _strict_check_daemon(daemon_name)
     try:
         s, token = ipc.connect(daemon_name, timeout=3.0)
         try:

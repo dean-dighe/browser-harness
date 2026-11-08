@@ -489,6 +489,8 @@ class Daemon:
         self._sensitive_sid = None  # the sensitive tab's session, set before auto-attach so no frame event is missed
         self._sensitive_frames = {}  # out-of-process iframe targetId -> its flattened session id
         self._sensitive_dialog = False
+        self._sensitive_pending = False  # set before a begin's first await: from then on ordinary requests are refused
+        self._ordinary = 0  # ordinary requests being served, which a begin waits out before it says guarded
 
     async def attach_first_page(self, replaces_session=None, enable_domains=True):
         """Attach to a real page (or any page). Sets self.session. Returns attached target or None."""
@@ -692,6 +694,8 @@ class Daemon:
         )))
 
     def _record_event(self, method, params, session_id=None):
+        if self._sensitive_pending and self._sensitive_sid is None:
+            return  # a session is being opened: nothing is kept from here on either
         if self._sensitive_sid is not None:
             # Nothing is kept while a sensitive session is open: Network events carry posted form bodies, dialogs and
             # console events can carry typed values. The browser still gets the event; only the buffer skips it. Two
@@ -748,6 +752,16 @@ class Daemon:
         self.cdp._event_registry.handle_event = tap
 
     async def handle(self, req):
+        meta = req.get("meta") if isinstance(req, dict) else None
+        if meta == "ping" or meta in ("sensitive_begin", "sensitive_end", "sensitive_state") or (isinstance(req, dict) and req.get("sensitive")):
+            return await self._handle(req)
+        self._ordinary += 1
+        try:
+            return await self._handle(req)
+        finally:
+            self._ordinary -= 1
+
+    async def _handle(self, req):
         # Token guard for Windows TCP loopback: any local process can otherwise
         # connect and issue CDP commands. expected_token() is None on POSIX so
         # this check is a no-op there (AF_UNIX + chmod 600 is the boundary).
@@ -768,7 +782,7 @@ class Daemon:
             async with self._sensitive_lock:
                 if not await self._sensitive_end(close=True):
                     return {"error": "sensitive-end-failed"}
-        if self.sensitive is not None or meta in ("sensitive_begin", "sensitive_end") or req.get("sensitive"):
+        if self.sensitive is not None or self._sensitive_pending or meta in ("sensitive_begin", "sensitive_end") or req.get("sensitive"):
             return await self._sensitive_handle(req, meta)
         if meta == "drain_events":
             out = list(self.events); self.events.clear()
@@ -999,9 +1013,20 @@ class Daemon:
             async with self._sensitive_lock:
                 if self.sensitive is not None:
                     return {"error": "sensitive-busy"}
-                return await self._sensitive_begin(req.get("max_seconds"))
+                # The barrier goes up before any await: new ordinary requests are refused from here, and the ones already
+                # being served are waited out (at most 5 s) before the session's tab is made.
+                self._sensitive_pending = True
+                try:
+                    until = time.monotonic() + 5
+                    while self._ordinary > 0:
+                        if time.monotonic() >= until:
+                            return {"error": "sensitive-busy"}
+                        await asyncio.sleep(0.02)
+                    return await self._sensitive_begin(req.get("max_seconds"))
+                finally:
+                    self._sensitive_pending = False
         if state is None:
-            return {"error": "sensitive-not-open"}
+            return {"error": "sensitive-busy" if self._sensitive_pending else "sensitive-not-open"}
         if not secrets.compare_digest(str(req.get("sensitive") or ""), state["token"]):
             return {"error": "sensitive-busy"}
         if meta == "sensitive_end":
