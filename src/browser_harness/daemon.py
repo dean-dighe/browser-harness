@@ -258,6 +258,26 @@ def _safe_connection_label(url):
         return "<redacted-cdp-endpoint>"
 
 
+def _origin_only(url):
+    """scheme://host[:port] of a URL, 'about:' for about: pages, None for anything else. Never a path, query or fragment."""
+    url = url or ""
+    if url.startswith("about:"):
+        return "about:"
+    try:
+        p = urlparse(url)
+    except ValueError:
+        return None
+    if p.scheme not in ("http", "https") or not p.hostname:
+        return None
+    host = f"[{p.hostname}]" if ":" in p.hostname else p.hostname.lower()
+    try:
+        port = p.port
+    except ValueError:
+        return None
+    default = {"http": 80, "https": 443}[p.scheme]
+    return f"{p.scheme}://{host}" + ("" if port in (None, default) else f":{port}")
+
+
 def _log_url(url):
     """A page URL for the log. Strict mode keeps the origin only: paths and queries can carry codes and tokens."""
     url = url or ""
@@ -490,6 +510,8 @@ class Daemon:
         self._sensitive_sid = None  # the sensitive tab's session, set before auto-attach so no frame event is missed
         self._sensitive_frames = {}  # out-of-process iframe targetId -> its flattened session id
         self._sensitive_dialog = False
+        self._sensitive_top = None  # the session tab's top-frame origin (scheme://host[:port]), never a path or query
+        self._sensitive_loaded = False  # whether that document's load event has fired
         self._sensitive_pending = False  # set before a begin's first await: from then on ordinary requests are refused
         self._ordinary = 0  # ordinary requests being served, which a begin waits out before it says guarded
 
@@ -713,6 +735,14 @@ class Daemon:
                     self._sensitive_dialog = True
                 elif method == "Page.javascriptDialogClosed":
                     self._sensitive_dialog = False
+                elif method == "Page.frameNavigated" and not (params.get("frame") or {}).get("parentId"):
+                    # The top frame's origin only: a redirect target's path and query (an OAuth code) are never kept.
+                    self._sensitive_top = _origin_only((params.get("frame") or {}).get("url"))
+                    self._sensitive_loaded = False
+                elif method == "Page.frameStartedLoading" and params.get("frameId") == (self.sensitive or {}).get("target_id"):
+                    self._sensitive_loaded = False
+                elif method == "Page.loadEventFired":
+                    self._sensitive_loaded = True
             return
         self.events.append({"method": method, "params": params, "session_id": session_id})
         if method == "Page.javascriptDialogOpening":
@@ -930,6 +960,7 @@ class Daemon:
             made["sid"] = (await self.cdp.send_raw("Target.attachToTarget", {"targetId": made["tid"], "flatten": True}))["sessionId"]
             sid = made["sid"]
             self._sensitive_sid, self._sensitive_frames, self._sensitive_dialog = sid, {}, False
+            self._sensitive_top, self._sensitive_loaded = "about:", False
             # Page and Runtime only: no Network domain, so no request bodies reach this process at all.
             for domain in ("Page", "Runtime"):
                 await self.cdp.send_raw(f"{domain}.enable", session_id=sid)
@@ -1010,6 +1041,7 @@ class Daemon:
         state["expiry_handle"].cancel()
         self.sensitive = None
         self._sensitive_sid, self._sensitive_frames, self._sensitive_dialog = None, {}, False
+        self._sensitive_top, self._sensitive_loaded = None, False
         self.events.clear()
         self.dialog = None
         log("sensitive session closed" + (" (tab closed)" if close else ""))
@@ -1051,7 +1083,8 @@ class Daemon:
         if state.get("ending"):
             return {"error": "sensitive-busy"}
         if meta == "sensitive_state":
-            return {"dialog": self._sensitive_dialog, "frames": sorted(self._sensitive_frames)}
+            return {"dialog": self._sensitive_dialog, "frames": sorted(self._sensitive_frames),
+                    "top_origin": self._sensitive_top, "loaded": self._sensitive_loaded}
         if meta:
             return {"error": "sensitive-refused"}
         method = req.get("method")
