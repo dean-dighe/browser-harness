@@ -134,6 +134,7 @@ RECOVERY_CANCEL_DRAIN_TIMEOUT = 2
 # Daemon._sensitive_handle.
 SENSITIVE_VERSION = 1
 SENSITIVE_MAX_SECONDS = 180
+SENSITIVE_SETUP_SECONDS = 10  # opening the session's tab; past it the setup is undone and the begin fails
 SENSITIVE_METHODS = frozenset((
     "Page.navigate",
     "Page.getFrameTree",
@@ -920,12 +921,14 @@ class Daemon:
     async def _sensitive_begin(self, max_seconds=None):
         if self._shutting_down:
             return {"error": "daemon is shutting down"}
-        tid = None
-        try:
-            tid = (await self.cdp.send_raw(
+        made = {}  # what the setup has made so far, for the cleanup
+
+        async def setup():
+            made["tid"] = (await self.cdp.send_raw(
                 "Target.createTarget", {"url": "about:blank", "newWindow": True, "background": True}
             ))["targetId"]
-            sid = (await self.cdp.send_raw("Target.attachToTarget", {"targetId": tid, "flatten": True}))["sessionId"]
+            made["sid"] = (await self.cdp.send_raw("Target.attachToTarget", {"targetId": made["tid"], "flatten": True}))["sessionId"]
+            sid = made["sid"]
             self._sensitive_sid, self._sensitive_frames, self._sensitive_dialog = sid, {}, False
             # Page and Runtime only: no Network domain, so no request bodies reach this process at all.
             for domain in ("Page", "Runtime"):
@@ -937,15 +940,27 @@ class Daemon:
                 {"autoAttach": True, "waitForDebuggerOnStart": False, "flatten": True},
                 session_id=sid,
             )
-        except Exception:
+
+        async def undo():
             self._sensitive_sid = None
             self._sensitive_frames = {}
-            if tid:
+            if made.get("tid"):
                 try:
-                    await asyncio.wait_for(self.cdp.send_raw("Target.closeTarget", {"targetId": tid}), timeout=3)
+                    await asyncio.wait_for(self.cdp.send_raw("Target.closeTarget", {"targetId": made["tid"]}), timeout=3)
                 except Exception:
                     pass
+
+        try:
+            # A Chrome that stops answering mid-setup must not hold the barrier (and every other client) for long.
+            await asyncio.wait_for(setup(), timeout=SENSITIVE_SETUP_SECONDS)
+        except asyncio.CancelledError:
+            await asyncio.shield(undo())
+            raise
+        except Exception:
+            await undo()
             return {"error": "sensitive-begin failed"}
+        tid = made["tid"]
+        sid = made["sid"]
         token = secrets.token_urlsafe(32)
         self.events.clear()
         self.dialog = None

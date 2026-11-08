@@ -765,6 +765,8 @@ def require_existing_daemon(name=None):
             s.close()
     except Exception as exc:
         raise RuntimeError(f"required daemon {daemon_name!r} is unhealthy: {exc}") from exc
+    if isinstance(resp, dict) and resp.get("error") == "sensitive-busy":
+        return  # healthy, serving a sign-in: as ensure_daemon treats it; the caller's own requests get sensitive-busy
     if not isinstance(resp, dict) or "result" not in resp:
         raise RuntimeError(f"required daemon {daemon_name!r} failed its CDP health check")
 
