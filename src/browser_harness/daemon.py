@@ -468,6 +468,7 @@ class Daemon:
         self.dialog = None
         self.stop = None  # asyncio.Event, set inside start()
         self.sensitive = None  # {"token", "target_id", "session_id", "expiry_handle"} while a sensitive session is open
+        self._sensitive_lock = asyncio.Lock()  # one begin or end at a time
 
     async def attach_first_page(self, replaces_session=None, enable_domains=True):
         """Attach to a real page (or any page). Sets self.session. Returns attached target or None."""
@@ -726,6 +727,10 @@ class Daemon:
         # `pid` lets restart_daemon() verify the live daemon's identity before
         # signaling — protects against SIGTERM-by-stale-pid-file after PID reuse.
         if meta == "ping":        return {"pong": True, "pid": os.getpid(), "browser_kind": BROWSER_KIND}
+        if meta == "shutdown" and self.sensitive is not None:
+            # A deliberate stop ends the sign-in attempt; its tab is closed before the daemon goes.
+            async with self._sensitive_lock:
+                await self._sensitive_end(close=True)
         if self.sensitive is not None or meta in ("sensitive_begin", "sensitive_end") or req.get("sensitive"):
             return await self._sensitive_handle(req, meta)
         if meta == "drain_events":
@@ -882,29 +887,31 @@ class Daemon:
             limit = min(SENSITIVE_MAX_SECONDS, max(5, int(max_seconds or SENSITIVE_MAX_SECONDS)))
         except (TypeError, ValueError):
             limit = SENSITIVE_MAX_SECONDS
-        expiry = asyncio.get_running_loop().call_later(
-            limit, lambda: asyncio.create_task(self._sensitive_end(close=True))
-        )
+        expiry = asyncio.get_running_loop().call_later(limit, lambda: asyncio.create_task(self._sensitive_expire(token)))
         self.sensitive = {"token": token, "target_id": tid, "session_id": sid, "expiry_handle": expiry}
         log("sensitive session opened")
         return {"token": token, "target_id": tid, "version": SENSITIVE_VERSION, "guarded": True,
                 "max_seconds": limit}
 
+    async def _sensitive_expire(self, token):
+        async with self._sensitive_lock:
+            if self.sensitive is not None and self.sensitive["token"] == token:
+                await self._sensitive_end(close=True)
+
     async def _sensitive_end(self, close):
+        """End the open sensitive session. Callers hold _sensitive_lock, except shutdown."""
         state, self.sensitive = self.sensitive, None
         if state is None:
             return
         state["expiry_handle"].cancel()
-        if close:
-            try:
-                await self.cdp.send_raw("Target.closeTarget", {"targetId": state["target_id"]})
-            except Exception:
-                pass
-        else:
-            try:
-                await self.cdp.send_raw("Target.detachFromTarget", {"sessionId": state["session_id"]})
-            except Exception:
-                pass
+        method, params = (
+            ("Target.closeTarget", {"targetId": state["target_id"]}) if close
+            else ("Target.detachFromTarget", {"sessionId": state["session_id"]})
+        )
+        try:
+            await asyncio.wait_for(self.cdp.send_raw(method, params), timeout=3)
+        except Exception:
+            log(f"sensitive session end: {method} failed")
         self.events.clear()
         self.dialog = None
         log("sensitive session closed" + (" (tab closed)" if close else ""))
@@ -917,15 +924,19 @@ class Daemon:
         echo an expression or typed text), and a lost session is not recovered or replayed."""
         state = self.sensitive
         if meta == "sensitive_begin":
-            if state is not None:
+            if self._sensitive_lock.locked():
                 return {"error": "sensitive-busy"}
-            return await self._sensitive_begin(req.get("max_seconds"))
+            async with self._sensitive_lock:
+                if self.sensitive is not None:
+                    return {"error": "sensitive-busy"}
+                return await self._sensitive_begin(req.get("max_seconds"))
         if state is None:
             return {"error": "sensitive-not-open"}
         if not secrets.compare_digest(str(req.get("sensitive") or ""), state["token"]):
             return {"error": "sensitive-busy"}
         if meta == "sensitive_end":
-            await self._sensitive_end(close=not req.get("keep"))
+            async with self._sensitive_lock:
+                await self._sensitive_end(close=not req.get("keep"))
             return {"ok": True}
         if meta:
             return {"error": "sensitive-refused"}
@@ -973,6 +984,8 @@ async def serve(d):
         # A server crash/cancellation does not pass through meta=shutdown.
         # Establish the same recovery barrier before touching owned targets.
         d._shutting_down = True
+        if d.sensitive is not None and d.cdp:
+            await d._sensitive_end(close=True)  # never leave a tab with typed values behind
         recoveries_drained = await d._cancel_and_drain_recoveries()
         # Named non-cloud daemons create one dedicated background tab. Shutdown
         # has blocked new recovery and drained active recovery before setting

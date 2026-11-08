@@ -538,6 +538,7 @@ def ensure_daemon(wait=None, name=None, env=None):
                 s, token = ipc.connect(name or NAME, timeout=3.0)
                 resp = ipc.request(s, token, {"method": "Target.getTargets", "params": {}})
                 if "result" in resp: return
+                if resp.get("error") == "sensitive-busy": return  # alive, serving a sign-in; never restart it
             except Exception:
                 pass
             if not last: time.sleep(0.5)
