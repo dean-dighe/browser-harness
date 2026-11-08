@@ -98,11 +98,66 @@ class SensitiveSession:
         self.max_seconds = info["max_seconds"]
         self.keep = False
 
-    def cdp(self, method, _response_timeout=DEFAULT_IPC_RESPONSE_TIMEOUT_SECONDS, **params):
-        return _send(
-            {"method": method, "params": params, "sensitive": self.token},
-            response_timeout=_response_timeout,
-        ).get("result", {})
+    def cdp(self, method, _response_timeout=DEFAULT_IPC_RESPONSE_TIMEOUT_SECONDS, _frame_target=None, **params):
+        req = {"method": method, "params": params, "sensitive": self.token}
+        if _frame_target is not None:
+            req["frame_target"] = _frame_target
+        return _send(req, response_timeout=_response_timeout).get("result", {})
+
+    def state(self):
+        """{dialog: bool, frames: [out-of-process iframe target ids]} for the session's tab. No text."""
+        return _send({"meta": "sensitive_state", "sensitive": self.token})
+
+    def _world(self, frame_id, frame_target=None):
+        return self.cdp(
+            "Page.createIsolatedWorld", _frame_target=frame_target, frameId=frame_id, worldName="bh-sensitive",
+        )["executionContextId"]
+
+    def call(self, function_declaration, args=(), frame=None, timeout=DEFAULT_IPC_RESPONSE_TIMEOUT_SECONDS):
+        """Run `function_declaration` once, with `args` passed as call arguments (never put in script source), in a
+        fresh isolated world of the top document, or of the iframe matched by the `frame` selector in the top document.
+
+        The function runs in a world of its own, so page scripts cannot replace what it calls. A context that went stale
+        (the document navigated) fails; nothing is retried. Raises RuntimeError with a fixed reason on any failure:
+        `frame-missing`, `session-lost` or `call-failed`. Returns the function's value."""
+        top = self.cdp("Page.getFrameTree")["frameTree"]["frame"]["id"]
+        frame_target = None
+        if frame is None:
+            ctx = self._world(top)
+        else:
+            top_ctx = self._world(top)
+            r = self.cdp(
+                "Runtime.callFunctionOn", executionContextId=top_ctx,
+                functionDeclaration="function(s){const e=document.querySelector(s);"
+                                    "return e&&e.tagName==='IFRAME'?e:null}",
+                arguments=[{"value": frame}], returnByValue=False,
+            )
+            obj = (r.get("result") or {}).get("objectId")
+            if not obj:
+                raise RuntimeError("frame-missing")
+            try:
+                frame_id = (self.cdp("DOM.describeNode", objectId=obj).get("node") or {}).get("frameId")
+            finally:
+                try:
+                    self.cdp("Runtime.releaseObject", objectId=obj)
+                except RuntimeError:
+                    pass
+            if not frame_id:
+                raise RuntimeError("frame-missing")
+            if frame_id in self.state()["frames"]:
+                frame_target = frame_id  # out of process: its own session, its own frame tree
+            ctx = self._world(frame_id, frame_target)
+        try:
+            r = self.cdp(
+                "Runtime.callFunctionOn", _response_timeout=timeout, _frame_target=frame_target,
+                executionContextId=ctx, functionDeclaration=function_declaration,
+                arguments=[{"value": a} for a in args], returnByValue=True, awaitPromise=True,
+            )
+        except RuntimeError as e:
+            raise RuntimeError("session-lost" if str(e) == "session-lost" else "call-failed") from None
+        if r.get("exceptionDetails"):
+            raise RuntimeError("call-failed")
+        return (r.get("result") or {}).get("value")
 
     def evaluate(self, expression, timeout=DEFAULT_IPC_RESPONSE_TIMEOUT_SECONDS):
         """Evaluate in the session's tab and return the value. A thrown exception raises RuntimeError without its text."""

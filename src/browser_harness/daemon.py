@@ -137,10 +137,19 @@ SENSITIVE_MAX_SECONDS = 180
 SENSITIVE_METHODS = frozenset((
     "Page.navigate",
     "Page.getFrameTree",
+    "Page.createIsolatedWorld",
     "Runtime.evaluate",
-    "Input.insertText",
-    "Input.dispatchKeyEvent",
-    "Input.dispatchMouseEvent",
+    "Runtime.callFunctionOn",
+    "Runtime.releaseObject",
+    "DOM.describeNode",
+))
+# Methods the holder may send to an out-of-process iframe of the sensitive tab (frame_target in the request).
+SENSITIVE_FRAME_METHODS = frozenset((
+    "Page.createIsolatedWorld",
+    "Page.getFrameTree",
+    "Runtime.evaluate",
+    "Runtime.callFunctionOn",
+    "Runtime.releaseObject",
 ))
 TAB_MARKER_JS = "if(!document.title.startsWith('\U0001F434'))document.title='\U0001F434 '+document.title"
 
@@ -469,6 +478,9 @@ class Daemon:
         self.stop = None  # asyncio.Event, set inside start()
         self.sensitive = None  # {"token", "target_id", "session_id", "expiry_handle"} while a sensitive session is open
         self._sensitive_lock = asyncio.Lock()  # one begin or end at a time
+        self._sensitive_sid = None  # the sensitive tab's session, set before auto-attach so no frame event is missed
+        self._sensitive_frames = {}  # out-of-process iframe targetId -> its flattened session id
+        self._sensitive_dialog = False
 
     async def attach_first_page(self, replaces_session=None, enable_domains=True):
         """Attach to a real page (or any page). Sets self.session. Returns attached target or None."""
@@ -672,9 +684,22 @@ class Daemon:
         )))
 
     def _record_event(self, method, params, session_id=None):
-        if self.sensitive is not None:
+        if self._sensitive_sid is not None:
             # Nothing is kept while a sensitive session is open: Network events carry posted form bodies, dialogs and
-            # console events can carry typed values. The browser still gets the event; only the buffer skips it.
+            # console events can carry typed values. The browser still gets the event; only the buffer skips it. Two
+            # facts are kept for the holder, without text: which iframes of the tab run out of process, and whether a
+            # JS dialog is open.
+            if session_id == self._sensitive_sid:
+                if method == "Target.attachedToTarget" and (params.get("targetInfo") or {}).get("type") == "iframe":
+                    self._sensitive_frames[params["targetInfo"]["targetId"]] = params["sessionId"]
+                elif method == "Target.detachedFromTarget":
+                    self._sensitive_frames = {
+                        t: s for t, s in self._sensitive_frames.items() if s != params.get("sessionId")
+                    }
+                elif method == "Page.javascriptDialogOpening":
+                    self._sensitive_dialog = True
+                elif method == "Page.javascriptDialogClosed":
+                    self._sensitive_dialog = False
             return
         self.events.append({"method": method, "params": params, "session_id": session_id})
         if method == "Page.javascriptDialogOpening":
@@ -869,16 +894,31 @@ class Daemon:
     async def _sensitive_begin(self, max_seconds=None):
         if self._shutting_down:
             return {"error": "daemon is shutting down"}
+        tid = None
         try:
             tid = (await self.cdp.send_raw(
                 "Target.createTarget", {"url": "about:blank", "newWindow": True, "background": True}
             ))["targetId"]
             sid = (await self.cdp.send_raw("Target.attachToTarget", {"targetId": tid, "flatten": True}))["sessionId"]
+            self._sensitive_sid, self._sensitive_frames, self._sensitive_dialog = sid, {}, False
             # Page and Runtime only: no Network domain, so no request bodies reach this process at all.
             for domain in ("Page", "Runtime"):
                 await self.cdp.send_raw(f"{domain}.enable", session_id=sid)
             await self._emulate_focus(sid)
+            # Out-of-process iframes (a sign-in form on another site) attach as their own sessions.
+            await self.cdp.send_raw(
+                "Target.setAutoAttach",
+                {"autoAttach": True, "waitForDebuggerOnStart": False, "flatten": True},
+                session_id=sid,
+            )
         except Exception:
+            self._sensitive_sid = None
+            self._sensitive_frames = {}
+            if tid:
+                try:
+                    await asyncio.wait_for(self.cdp.send_raw("Target.closeTarget", {"targetId": tid}), timeout=3)
+                except Exception:
+                    pass
             return {"error": "sensitive-begin failed"}
         token = secrets.token_urlsafe(32)
         self.events.clear()
@@ -901,6 +941,7 @@ class Daemon:
     async def _sensitive_end(self, close):
         """End the open sensitive session. Callers hold _sensitive_lock, except shutdown."""
         state, self.sensitive = self.sensitive, None
+        self._sensitive_sid, self._sensitive_frames, self._sensitive_dialog = None, {}, False
         if state is None:
             return
         state["expiry_handle"].cancel()
@@ -938,13 +979,24 @@ class Daemon:
             async with self._sensitive_lock:
                 await self._sensitive_end(close=not req.get("keep"))
             return {"ok": True}
+        if meta == "sensitive_state":
+            return {"dialog": self._sensitive_dialog, "frames": sorted(self._sensitive_frames)}
         if meta:
             return {"error": "sensitive-refused"}
         method = req.get("method")
-        if method not in SENSITIVE_METHODS:
-            return {"error": "sensitive-refused"}
+        frame_target = req.get("frame_target")
+        if frame_target is not None:
+            session = self._sensitive_frames.get(frame_target)
+            if session is None:
+                return {"error": "session-lost"}
+            if method not in SENSITIVE_FRAME_METHODS:
+                return {"error": "sensitive-refused"}
+        else:
+            session = state["session_id"]
+            if method not in SENSITIVE_METHODS:
+                return {"error": "sensitive-refused"}
         try:
-            return {"result": await self.cdp.send_raw(method, req.get("params") or {}, session_id=state["session_id"])}
+            return {"result": await self.cdp.send_raw(method, req.get("params") or {}, session_id=session)}
         except Exception as e:
             if "Session with given id not found" in str(e) or "No target with given id" in str(e):
                 return {"error": "session-lost"}
