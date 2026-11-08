@@ -527,6 +527,7 @@ def run_doctor_fix_snap():
 def ensure_daemon(wait=None, name=None, env=None):
     """Idempotent. Self-heals stale daemon, closed Chrome (launches it), cold
     Chrome, and missing Allow on chrome://inspect."""
+    paths.strict_check_env(env)  # strict mode: one loopback CDP endpoint, no cloud, so never local discovery or launch
     if daemon_alive(name):
         # Stale daemons accept connects AND reply to meta:* (pure Python) even when the
         # CDP WS to Chrome is dead — probe with a real CDP call and require "result".
@@ -886,6 +887,7 @@ def restart_daemon(name=None, require_clean=False):
 
 
 def _browser_use(path, method, body=None):
+    paths.strict_refuse("the Browser Use cloud")
     key = auth.get_browser_use_api_key()
     req = urllib.request.Request(
         f"{BU_API}{path}",
@@ -999,6 +1001,8 @@ def _resolve_profile_name(profile_name):
 def start_remote_daemon(name="remote", profileName=None, **create_kwargs):
     """Provision a Browser Use cloud browser and start a daemon attached to it.
 
+    Refused in strict mode (BH_STRICT_CDP=1).
+
     kwargs forwarded to `POST /browsers` (camelCase):
       profileId        — cloud profile UUID; start already-logged-in. Default: none (clean browser).
       profileName      — cloud profile name; resolved client-side to profileId via list_cloud_profiles().
@@ -1011,6 +1015,7 @@ def start_remote_daemon(name="remote", profileName=None, **create_kwargs):
     URL and opens it locally when a GUI is detected. Set BH_OPEN_LIVE_URL to
     0, false, no, or off (case-insensitive) to suppress only those display side
     effects; the returned URL remains present."""
+    paths.strict_refuse("the Browser Use cloud")
     show_live_view = _should_show_remote_live_view()
     if daemon_alive(name):
         raise RuntimeError(f"daemon {name!r} already alive -- restart_daemon({name!r}) first")
@@ -1149,7 +1154,9 @@ def _cache_write(data):
 
 
 def _latest_release_tag(force=False):
-    """Return latest PyPI version, or None. Cached for 24h to avoid hammering PyPI."""
+    """Return latest PyPI version, or None. Cached for 24h to avoid hammering PyPI. None in strict mode."""
+    if paths.strict():
+        return None
     cache = _cache_read()
     now = time.time()
     if not force and cache.get("tag") and now - cache.get("fetched_at", 0) < VERSION_CACHE_TTL:
@@ -1274,13 +1281,15 @@ def _profile_directory_args(base):
 
 
 def _launch_browser():
-    """Prefers the browser whose profile already has perm box checked.
+    """Prefers the browser whose profile already has perm box checked. Never in strict mode.
 
     Returns ``(process, profile)`` on success. ``process`` is available only
     when we launched the browser directly; ``profile`` is the user-data dir we
     expect that browser to use. The caller uses both to clean up a direct
     launch that never becomes reachable over CDP.
     """
+    if paths.strict():
+        return None
     import platform, shutil, subprocess
     from .daemon import PROFILES, remote_debugging_toggle_profiles
 

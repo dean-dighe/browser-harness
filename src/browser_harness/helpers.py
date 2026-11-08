@@ -631,7 +631,8 @@ def http_get(url, headers=None, timeout=20.0):
     """Pure HTTP — no browser. Use for static pages / APIs. Wrap in ThreadPoolExecutor for bulk.
 
     When BROWSER_USE_API_KEY is set, routes through the fetch-use proxy (handles bot
-    detection, residential proxies, retries). Falls back to local urllib otherwise."""
+    detection, residential proxies, retries). Falls back to local urllib otherwise. Off in strict mode."""
+    paths.strict_refuse("http_get")
     if os.environ.get("BROWSER_USE_API_KEY"):
         try:
             from fetch_use import fetch_sync

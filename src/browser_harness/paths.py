@@ -10,9 +10,40 @@ def env_flag(name: str) -> bool:
     return (os.environ.get(name) or "").strip() == "1"
 
 
+def strict() -> bool:
+    """Fleet fork: BH_STRICT_CDP=1. The harness drives only the loopback CDP endpoint it is given: no local browser
+    discovery or launch, no 9222/9223 probe, no Browser Use cloud, no PyPI check, no fetch-use, no .env files."""
+    return env_flag("BH_STRICT_CDP")
+
+
 def dotenv_enabled() -> bool:
-    """Fleet fork: BH_NO_DOTENV=1 skips the repo and workspace .env files, so only the caller's env configures a daemon."""
-    return not env_flag("BH_NO_DOTENV")
+    """Fleet fork: BH_NO_DOTENV=1 (or strict mode) skips the repo and workspace .env files."""
+    return not (env_flag("BH_NO_DOTENV") or strict())
+
+
+_LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+
+
+def strict_refuse(what: str) -> None:
+    """Raise when strict mode forbids `what` (a short name for the refused path)."""
+    if strict():
+        raise RuntimeError(f"strict-cdp: {what} is off (BH_STRICT_CDP=1)")
+
+
+def strict_check_env(overrides=None) -> None:
+    """In strict mode, require exactly one loopback CDP endpoint and no cloud settings in os.environ plus `overrides`."""
+    if not strict():
+        return
+    from urllib.parse import urlparse
+    env = {**os.environ, **(overrides or {})}
+    if env.get("BU_BROWSER_ID") or env.get("BROWSER_USE_API_KEY"):
+        raise RuntimeError("strict-cdp: BU_BROWSER_ID and BROWSER_USE_API_KEY must be unset (BH_STRICT_CDP=1)")
+    urls = [v for v in (env.get("BU_CDP_URL"), env.get("BU_CDP_WS")) if v]
+    if len(urls) != 1:
+        raise RuntimeError("strict-cdp: set exactly one of BU_CDP_URL or BU_CDP_WS (BH_STRICT_CDP=1)")
+    parsed = urlparse(urls[0])
+    if parsed.scheme not in {"http", "ws"} or parsed.hostname not in _LOOPBACK or not parsed.port:
+        raise RuntimeError("strict-cdp: the CDP endpoint must be http:// or ws:// on loopback with a port (BH_STRICT_CDP=1)")
 
 
 def home_dir() -> Path:

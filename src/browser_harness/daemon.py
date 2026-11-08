@@ -264,6 +264,7 @@ def _ws_from_devtools_active_port(http_url: str) -> str | None:
 
 
 def get_ws_url():
+    paths.strict_check_env()
     if url := os.environ.get("BU_CDP_WS"):
         return url
     if url := os.environ.get("BU_CDP_URL"):
@@ -280,7 +281,7 @@ def get_ws_url():
                 last_err = e
                 if e.code == 403:
                     raise RuntimeError("permission-blocked: Chrome is reachable, but the per-session Allow remote debugging popup has not been accepted")
-                if e.code == 404 and (ws := _ws_from_devtools_active_port(url)):
+                if e.code == 404 and not paths.strict() and (ws := _ws_from_devtools_active_port(url)):
                     return ws
                 time.sleep(1)
             except Exception as e:
@@ -348,6 +349,7 @@ def stop_remote(strict=False):
     global _REMOTE_STOPPED
     if not REMOTE_ID:
         return True
+    paths.strict_refuse("the Browser Use cloud")
     if _REMOTE_STOPPED:
         return True
     last_error = None
