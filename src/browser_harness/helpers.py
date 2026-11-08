@@ -654,6 +654,10 @@ from .recorder import start_recording, stop_recording, recording_dir
 
 
 def _load_agent_helpers():
+    # Fleet fork: agent_helpers.py runs arbitrary code and can replace any helper, so it loads only with
+    # BH_AGENT_HELPERS=1, and never in strict mode.
+    if not paths.env_flag("BH_AGENT_HELPERS") or paths.strict():
+        return
     p = AGENT_WORKSPACE / "agent_helpers.py"
     if not p.exists():
         return
